@@ -1,9 +1,3 @@
-Flask==2.2.5
-flask-cors
-pandas
-numpy
-opencv-python-headless
-face_recognition==1.3.0
-pillow
+flask
 gunicorn
-requests
+numpy

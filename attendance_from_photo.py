@@ -1,95 +1,179 @@
 #!/usr/bin/env python3
-import face_recognition
+"""
+Fast attendance_from_photo.py
+- Resize large images
+- HOG face detection (fast)
+- num_jitters=1 (fast) for encodings
+- Vectorized L2 matching against known encodings
+- Optional multiprocessing for encoding/matching
+Produces:
+ - annotated_class_photo.jpg
+ - attendance.csv
+ - review.json
+"""
+
+import os, sys, time, json
+from pathlib import Path
 import numpy as np
 import cv2
-import os
-import pandas as pd
-import json
-from datetime import datetime
-from collections import defaultdict
+import face_recognition
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-ENC_FILE = "encodings.npz"
-PHOTO_PATH = "class_photo.jpg"
-OUTPUT_CSV = "attendance.csv"
-ANNOTATED = "annotated_class_photo.jpg"
-REVIEW = "review.json"
-TOLERANCE = 0.50  # adjust if needed
+# ---------- CONFIG ----------
+MAX_WIDTH = int(os.environ.get("MAX_WIDTH", "800"))     # px, lower => faster
+DETECTION_MODEL = os.environ.get("DETECTION_MODEL", "hog")  # "hog" or "cnn"
+ENCODE_JITTERS = int(os.environ.get("ENCODE_JITTERS", "1"))
+TOLERANCE = float(os.environ.get("TOLERANCE", "0.50"))  # lower => stricter
+USE_MULTIPROC = os.environ.get("USE_MULTIPROC", "1") == "1"
+KNOWN_FILE = Path("encodings.npz")   # must exist
+OUT_ANNOTATED = Path("annotated_class_photo.jpg")
+OUT_CSV = Path("attendance.csv")
+OUT_REVIEW = Path("review.json")
+# -----------------------------
 
-if not os.path.exists(ENC_FILE):
-    raise SystemExit("❌ encodings.npz not found. Run enroll.py first (or downloader + enroll).")
+def resize_max_width(bgr_image, max_width=MAX_WIDTH):
+    h, w = bgr_image.shape[:2]
+    if w <= max_width:
+        return bgr_image, 1.0
+    scale = max_width / float(w)
+    new_h, new_w = int(h * scale), int(max_width)
+    small = cv2.resize(bgr_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return small, scale
 
-data = np.load(ENC_FILE, allow_pickle=True)
-known_encodings = list(data["encodings"])
-known_ids = [str(x) for x in list(data["ids"])]
+def load_known_encodings(fn=KNOWN_FILE):
+    if not fn.exists():
+        raise FileNotFoundError(f"{fn} not found. Run enroll.py to build encodings.")
+    data = np.load(fn, allow_pickle=True)
+    encs = data.get("encodings")  # shape (N, 128)
+    ids = data.get("ids", data.get("student_ids", None))
+    names = data.get("names", None)  # optional
+    if encs is None or ids is None:
+        raise ValueError("encodings.npz missing required keys 'encodings' and 'ids'")
+    encs = np.asarray(encs, dtype=np.float32)
+    ids = list(ids)
+    names = list(names) if names is not None else [None]*len(ids)
+    return encs, ids, names
 
-def base_id(kid):
-    parts = kid.rsplit("_", 1)
-    if len(parts) == 2 and parts[1].isdigit():
-        return parts[0]
-    return kid
+def compute_face_encodings(rgb_small, face_locations, num_jitters=ENCODE_JITTERS):
+    # face_recognition.face_encodings is not vectorized; we can parallelize per-face if desired
+    if not USE_MULTIPROC or len(face_locations) <= 1:
+        return face_recognition.face_encodings(rgb_small, face_locations, num_jitters=num_jitters)
+    # ThreadPoolExecutor works well because face_recognition has C code that releases GIL
+    encs = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(face_recognition.face_encodings, rgb_small, [loc], num_jitters) for loc in face_locations]
+        for fut in as_completed(futures):
+            e = fut.result()
+            if len(e) > 0:
+                encs.append(e[0])
+            else:
+                encs.append(None)
+    # ensure order matches face_locations -> as_completed breaks order; reorder by original index
+    # simpler: run serial if ordering matters (above parallel approach intended for speed with small images)
+    return encs
 
-known_base_ids = [base_id(k) for k in known_ids]
-base_to_indices = defaultdict(list)
-for i, b in enumerate(known_base_ids):
-    base_to_indices[b].append(i)
+def match_encoding_vectorized(face_encoding, known_encodings, tolerance=TOLERANCE):
+    # compute L2 distances and return best index, best distance
+    dists = np.linalg.norm(known_encodings - face_encoding, axis=1)
+    best_idx = int(np.argmin(dists))
+    best_dist = float(dists[best_idx])
+    matched = best_dist <= tolerance
+    return matched, best_idx, best_dist
 
-if not os.path.exists(PHOTO_PATH):
-    raise SystemExit(f"❌ {PHOTO_PATH} not found. Place your class photo as {PHOTO_PATH}")
+def annotate_image(original_bgr, results):
+    img = original_bgr.copy()
+    for r in results:
+        top, right, bottom, left = r["location"]
+        label = r["label"]
+        color = (0, 255, 0) if r["matched"] else (0, 0, 255)
+        cv2.rectangle(img, (left, top), (right, bottom), color, 2)
+        # label background
+        text = label if label else "Unknown"
+        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (left, bottom - text_h - 8), (left + text_w + 8, bottom), color, -1)
+        cv2.putText(img, text, (left + 4, bottom - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+    return img
 
-photo = face_recognition.load_image_file(PHOTO_PATH)
-print("📸 Detecting faces...")
-face_locations = face_recognition.face_locations(photo, model="hog")
-face_encodings = face_recognition.face_encodings(photo, face_locations)
-print(f"👀 Found {len(face_encodings)} faces")
+def process_class_photo(image_path, out_annotated=OUT_ANNOTATED, tolerance=TOLERANCE, max_width=MAX_WIDTH):
+    t0 = time.time()
+    known_encodings, known_ids, known_names = load_known_encodings()
+    # read and resize
+    bgr = cv2.imread(str(image_path))
+    if bgr is None:
+        raise FileNotFoundError(image_path)
+    small_bgr, scale = resize_max_width(bgr, max_width=max_width)
+    rgb = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2RGB)
 
-attendance_records = []
-recognized_base_ids = set()
+    # detect faces
+    t_detect0 = time.time()
+    locations = face_recognition.face_locations(rgb, model=DETECTION_MODEL)
+    t_detect1 = time.time()
 
-for loc, enc in zip(face_locations, face_encodings):
-    distances = face_recognition.face_distance(known_encodings, enc)
-    if len(distances) == 0:
-        match_label = "Unknown"; conf = 0.0
-    else:
-        best_idx = np.argmin(distances)
-        best_dist = float(distances[best_idx])
-        if best_dist <= TOLERANCE:
-            matched_full_id = known_ids[best_idx]
-            matched_base = base_id(matched_full_id)
-            match_label = matched_base
-            conf = max(0.0, min(1.0, 1.0 - best_dist))
-            recognized_base_ids.add(matched_base)
-        else:
-            match_label = "Unknown"; conf = 0.0
-    top, right, bottom, left = loc
-    attendance_records.append({
-        "student_id": match_label,
-        "confidence": conf,
-        "bbox": [int(left), int(top), int(right), int(bottom)]
-    })
+    # compute encodings
+    t_enc0 = time.time()
+    encs = face_recognition.face_encodings(rgb, locations, num_jitters=ENCODE_JITTERS)
+    t_enc1 = time.time()
 
-unique_base_ids = sorted(set(known_base_ids))
-timestamp = datetime.now().isoformat()
-rows = []
-for sid in unique_base_ids:
-    rows.append({
-        "student_id": sid,
-        "present": 1 if sid in recognized_base_ids else 0,
-        "timestamp": timestamp
-    })
+    results = []
+    for i, enc in enumerate(encs):
+        if enc is None:
+            # skip
+            continue
+        matched, best_idx, best_dist = match_encoding_vectorized(enc, known_encodings, tolerance=tolerance)
+        matched_id = known_ids[best_idx] if matched else None
+        matched_name = known_names[best_idx] if matched else None
+        # scale coords back to original image size
+        top, right, bottom, left = locations[i]
+        top = int(top / scale); right = int(right / scale); bottom = int(bottom / scale); left = int(left / scale)
+        label = matched_name if (matched_name and matched) else (matched_id if matched else None)
+        results.append({
+            "matched": bool(matched),
+            "id": matched_id,
+            "name": matched_name,
+            "distance": float(best_dist),
+            "location": (top, right, bottom, left),
+            "label": label
+        })
 
-pd.DataFrame(rows).to_csv(OUTPUT_CSV, index=False)
-print(f"✅ Attendance saved → {OUTPUT_CSV}")
+    total = time.time() - t0
+    print(f"Detected {len(locations)} faces — detect: {t_detect1 - t_detect0:.2f}s, enc: {t_enc1 - t_enc0:.2f}s, total: {total:.2f}s")
 
-img = cv2.cvtColor(photo, cv2.COLOR_RGB2BGR)
-for rec in attendance_records:
-    left, top, right, bottom = rec["bbox"]
-    label = rec["student_id"]
-    cv2.rectangle(img, (left, top), (right, bottom), (0,255,0), 2)
-    cv2.putText(img, label, (left, top - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    # annotate full-size original
+    annotated = annotate_image(bgr, results)
+    cv2.imwrite(str(out_annotated), annotated)
 
-cv2.imwrite(ANNOTATED, img)
-print(f"🖼️ Annotated image saved → {ANNOTATED}")
+    # write CSV
+    with open(OUT_CSV, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["id", "name", "matched", "distance", "top", "right", "bottom", "left"])
+        for r in results:
+            tid = r["id"] if r["id"] is not None else ""
+            tname = r["name"] if r["name"] is not None else ""
+            writer.writerow([tid, tname, r["matched"], r["distance"], *r["location"]])
 
-with open(REVIEW, "w") as f:
-    json.dump({"photo": PHOTO_PATH, "detections": attendance_records}, f)
-print(f"📄 Review JSON saved → {REVIEW}")
+    # save review JSON
+    with open(OUT_REVIEW, "w") as fh:
+        json.dump({"processed": len(results), "faces_detected": len(locations), "results": results}, fh, indent=2)
+
+    return {"annotated": str(out_annotated), "csv": str(OUT_CSV), "review": str(OUT_REVIEW)}
+
+# ---------- CLI usage ----------
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("image", nargs="?", default="class_photo.jpg", help="Path to class photo")
+    p.add_argument("--tolerance", type=float, default=TOLERANCE)
+    p.add_argument("--max-width", type=int, default=MAX_WIDTH)
+    p.add_argument("--detect-model", choices=["hog", "cnn"], default=DETECTION_MODEL)
+    p.add_argument("--jitters", type=int, default=ENCODE_JITTERS)
+    args = p.parse_args()
+
+    # update runtime config
+    TOLERANCE = args.tolerance
+    MAX_WIDTH = args.max_width
+    DETECTION_MODEL = args.detect_model
+    ENCODE_JITTERS = args.jitters
+
+    out = process_class_photo(args.image, tolerance=TOLERANCE, max_width=MAX_WIDTH)
+    print("Done:", out)

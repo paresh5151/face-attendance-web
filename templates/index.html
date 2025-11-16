@@ -1,31 +1,26 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
 
 <head>
-    <title>Face Attendance System</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <meta charset="utf-8">
+    <title>Face Attendance — Upload</title>
 </head>
 
 <body>
-
-    <div class="container">
-        <h1>Face Attendance System</h1>
-        <p>Upload a class photo to generate automatic attendance.</p>
-
-        <input id="uploadInput" type="file" accept="image/*" />
-        <button onclick="uploadPhoto()">Upload & Process</button>
-
-        <p id="status"></p>
-
-        <div id="result">
-            <h3>Result:</h3>
-            <img id="annotatedImg" style="max-width: 90%;" />
-            <br />
-            <a id="downloadCsv" download="attendance.csv">Download Attendance CSV</a>
-        </div>
-    </div>
-
-    <script src="/static/main.js"></script>
+    <h1>Face Attendance — Upload class photo</h1>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <ul>
+        {% for cat, msg in messages %}
+        <li><strong>{{ cat }}</strong>: {{ msg }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    {% endwith %}
+    <form method="post" enctype="multipart/form-data">
+        <input type="file" name="photo" accept="image/*" required>
+        <button type="submit">Upload & Process</button>
+    </form>
 </body>
 
 </html>
