@@ -1,48 +1,31 @@
-# Dockerfile (place at project root)
-FROM python:3.9-slim
+# Use conda image to get prebuilt dlib/opencv from conda-forge
+FROM continuumio/miniconda3:23.5.0
 
-# Install system dependencies required for dlib + OpenCV
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    pkg-config \
-    git \
-    wget \
-    curl \
-    unzip \
-    libopenblas-dev \
-    liblapack-dev \
-    libx11-dev \
-    libgtk-3-dev \
-    libjpeg-dev \
-    libpng-dev \
-    libtiff-dev \
-    libavcodec-dev \
-    libavformat-dev \
-    libswscale-dev \
-    libcurl4-openssl-dev \
-    libssl-dev \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create working directory
 WORKDIR /app
 
-# Copy requirements first (for Docker cache)
-COPY requirements.txt /app/requirements.txt
+# Use conda-forge and create env with python + prebuilt packages
+RUN conda config --append channels conda-forge && \
+    conda create -n faceenv python=3.9 -y && \
+    /bin/bash -lc "conda activate faceenv && conda install -y -c conda-forge \
+      dlib=19.24.2 \
+      opencv=4.10.0 \
+      numpy \
+      pandas \
+      pillow \
+      requests" && \
+    # pip-install lighter extras (Flask + gunicorn)
+    /bin/bash -lc "conda activate faceenv && pip install --no-cache-dir flask flask-cors gunicorn face_recognition==1.3.0"
 
-# Install Python dependencies
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install -r /app/requirements.txt
+# Make conda env available on PATH
+ENV PATH /opt/conda/envs/faceenv/bin:$PATH
 
-# Copy the rest of the app
+# Copy app code
 COPY . /app
 
-# Ensure known directory exists
+# Ensure known dir exists
 RUN mkdir -p /app/known
 
-# Expose port 5000
 EXPOSE 5000
 
-# Start using gunicorn
+# Run with gunicorn
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app", "--workers", "2", "--timeout", "120"]
