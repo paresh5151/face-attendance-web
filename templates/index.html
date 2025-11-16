@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Face Attendance System</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+
+    <div class="container">
+        <h1>Face Attendance System</h1>
+        <p>Upload a class photo to generate automatic attendance.</p>
+
+        <input id="uploadInput" type="file" accept="image/*" />
+        <button onclick="uploadPhoto()">Upload & Process</button>
+
+        <p id="status"></p>
+
+        <div id="result">
+            <h3>Result:</h3>
+            <img id="annotatedImg" style="max-width: 90%;" />
+            <br />
+            <a id="downloadCsv" download="attendance.csv">Download Attendance CSV</a>
+        </div>
+    </div>
+
+    <script src="/static/main.js"></script>
+</body>
+
+</html>

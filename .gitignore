@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files
+.env
+venv/
+venv*/
+*.sqlite3
+
+# OS files
+.DS_Store
+
+# Build artifacts
+*.log
+
+# App data (generated at runtime)
+known/
+encodings.npz
+annotated_class_photo.jpg
+attendance.csv
+review.json
+
+# Python cache
+*.egg-info/
+dist/
+build/
+
+# Editor folders
+.idea/
+.vscode/
